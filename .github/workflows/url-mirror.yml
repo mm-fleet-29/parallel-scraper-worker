@@ -1,0 +1,75 @@
+name: url-mirror
+
+# Generic: mirror a list of URLs (manifest in blob) to blob at a fixed total rate.
+# Manifest and results live in blob only; logs carry counts and status codes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pass_id:       { required: true,  type: string }
+      manifest_base: { required: true,  type: string, description: "blob URL prefix holding <shard>.jsonl (no SAS)" }
+      dest_base:     { required: true,  type: string, description: "blob URL prefix to write under (no SAS)" }
+      shards:        { required: false, type: string, default: "1", description: "number of shards s00..sNN" }
+      total_rate:    { required: false, type: string, default: "1.0", description: "requests/s summed over all shards" }
+  schedule:
+    - cron: "30 20 * * *"   # nightly purge of this workflow's completed runs
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: url-mirror-${{ inputs.pass_id || 'purge' }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      rate: ${{ steps.mk.outputs.rate }}
+    steps:
+      - id: mk
+        run: |
+          n=${{ inputs.shards }}
+          echo "matrix=$(python3 -c "import json;print(json.dumps(['s%02d'%i for i in range($n)]))")" >> $GITHUB_OUTPUT
+          echo "rate=$(python3 -c "print(round(${{ inputs.total_rate }}/$n, 3))")" >> $GITHUB_OUTPUT
+
+  mirror:
+    needs: plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools/mirror.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install requests
+      - name: Mirror shard
+        env:
+          MEDIA_BLOB_READ_SAS: ${{ secrets.MEDIA_BLOB_READ_SAS }}
+          MEDIA_BLOB_WRITE_SAS: ${{ secrets.MEDIA_BLOB_WRITE_SAS }}
+        run: |
+          python tools/mirror.py --manifest-base "${{ inputs.manifest_base }}" --dest-base "${{ inputs.dest_base }}" \
+            --shard "${{ matrix.shard }}" --rate "${{ needs.plan.outputs.rate }}"
+
+  purge:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Delete completed url-mirror runs older than 1 day
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cutoff=$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh api "repos/${{ github.repository }}/actions/workflows/url-mirror.yml/runs?status=completed&per_page=100" \
+            --jq ".workflow_runs[] | select(.created_at < \"$cutoff\") | .id" |
+          while read id; do gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" && echo "deleted 1"; done
